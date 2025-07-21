@@ -44,7 +44,7 @@ class PowerUsagePreprocessor:
             logging.error(f"데이터 로딩 중 오류 발생: {e}")
             raise
     
-    def rename_columns(self) -> None:
+    def _rename_columns(self) -> None:
         """
         데이터프레임 컬럼명을 영어로 변환
         """
@@ -80,7 +80,6 @@ class PowerUsagePreprocessor:
                 df['day_of_week'] = df['date_time'].dt.dayofweek
                 
                 # 주말/평일 구분
-                df['is_weekend'] = df['day_of_week'].apply(lambda x: 1 if x >= 5 else 0)
                 df['day_type'] = df['day_of_week'].apply(lambda x: 'weekend' if x >= 5 else 'weekday')
                 
                 # 공휴일 표시 (2024-06-06, 2024-08-15)
@@ -110,10 +109,6 @@ class PowerUsagePreprocessor:
             
             logging.info(f"건물 정보 - 태양광, ESS, PCS 용량 데이터 수치 데이터로 변경 완료: ")
 
-        # 결측치 처리
-        # self.handle_missing_values()
-
-    
     def merge_data(self) -> None:
         """
         train/test 데이터에 건물 정보 병합
@@ -274,17 +269,6 @@ class PowerUsagePreprocessor:
         else:
             return 'night'
     
-    def _categorize_season(self, month: int) -> str:
-        """계절 구분"""
-        if month in [12, 1, 2]:
-            return 'winter'
-        elif month in [3, 4, 5]:
-            return 'spring'
-        elif month in [6, 7, 8]:
-            return 'summer'
-        else:
-            return 'fall'
-    
     def get_data_info(self) -> Dict[str, Dict]:
         """
         전처리된 데이터 정보 반환
@@ -350,7 +334,7 @@ class PowerUsagePreprocessor:
         self.load_data()
         
         # 2. 컬럼명 변환
-        self.rename_columns()
+        self._rename_columns()
         
         # 3. 날짜/시간 전처리
         self.preprocess_datetime()
@@ -369,7 +353,7 @@ class PowerUsagePreprocessor:
             self.remove_outliers()
         
         # 8. 추가 특성 생성
-        self.create_features()
+        # self.create_features()
         
         # 9. 데이터 저장 (선택사항)
         if save_data:
