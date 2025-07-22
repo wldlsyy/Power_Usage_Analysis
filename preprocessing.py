@@ -19,7 +19,7 @@ class PowerUsagePreprocessor:
         # 컬럼명 매핑 딕셔너리
         self.column_mappings = {
             'train': ['num_date_time', 'building_num', 'date_time', 'temperature', 
-                     'rain', 'wind', 'humidity', 'sun', 'solar', 'power_usage'],
+                     'rain', 'wind', 'humidity', 'sunshine_duration', 'solar_radiation', 'power_usage'],
             'test': ['num_date_time', 'building_num', 'date_time', 'temperature', 
                     'rain', 'wind', 'humidity'],
             'building': ['building_num', 'building_type', 'floor_area', 'cool_area', 
@@ -81,7 +81,9 @@ class PowerUsagePreprocessor:
                 
                 # 주말/평일 구분
                 df['day_type'] = df['day_of_week'].apply(lambda x: 'weekend' if x >= 5 else 'weekday')
-                
+                # day_of_week는 필요없으니 제거
+                self.drop_columns(['day_of_week'])
+
                 # 공휴일 표시 (2024-06-06, 2024-08-15)
                 holiday_dates = ['2024-06-06', '2024-08-15']
                 df['is_holiday'] = df['date_time'].dt.date.isin([
@@ -163,36 +165,50 @@ class PowerUsagePreprocessor:
         
         logging.info("데이터 병합 완료")
     
-    def handle_missing_values(self, strategy: Dict[str, str] = None) -> None:
+    def handle_missing_values(self, strategy: Dict[str, str] = None, target_df: str = None) -> None:
         """
         결측값 처리
         
         Args:
             strategy: 컬럼별 결측값 처리 전략 딕셔너리
-                     예: {'solar_capacity': 'median', 'ess_capacity': 'mean'}
+                     예: {'solar_capacity': 'median', 'ess_capacity': 'zero'}
+            target_df: 결측값을 처리할 데이터프레임 이름 ('train', 'test', 'building')
+                      None이면 모든 데이터프레임에 적용
         """
         logging.info("결측값 처리 중...")
         
-        default_strategy = {
-            'solar_capacity': 'zero',  # 태양광이 없는 건물은 0으로 처리
-            'ess_capacity': 'zero',    # ESS가 없는 건물은 0으로 처리
-            'pcs_capacity': 'zero'     # PCS가 없는 건물은 0으로 처리
-        }
+        if strategy is None:
+            logging.warning("결측값 처리 전략이 지정되지 않았습니다.")
+            return
         
-        strategy = strategy or default_strategy
-        
-        for df in [self.train, self.test]:
-            if df is not None:
-                for col, method in strategy.items():
-                    if col in df.columns and df[col].isnull().sum() > 0:
-                        if method == 'zero':
-                            df[col].fillna(0, inplace=True)
-                        elif method == 'mean':
-                            df[col].fillna(df[col].mean(), inplace=True)
-                        elif method == 'median':
-                            df[col].fillna(df[col].median(), inplace=True)
-                        elif method == 'mode':
-                            df[col].fillna(df[col].mode()[0], inplace=True)
+        # 타겟 데이터프레임 선택
+        dataframes = []
+        if target_df is not None:
+            if not hasattr(self, target_df) or getattr(self, target_df) is None:
+                logging.error(f"'{target_df}' 데이터프레임이 존재하지 않습니다.")
+                return
+            dataframes = [getattr(self, target_df)]
+
+        # 각 데이터프레임에 결측값 처리 적용
+        for df in dataframes:
+            for col, method in strategy.items():
+                if col in df.columns and df[col].isnull().sum() > 0:
+                    missing_count = df[col].isnull().sum()
+                    
+                    if method == 'zero':
+                        df[col].fillna(0, inplace=True)
+                    elif method == 'mean':
+                        df[col].fillna(df[col].mean(), inplace=True)
+                    elif method == 'median':
+                        df[col].fillna(df[col].median(), inplace=True)
+                    elif method == 'mode':
+                        df[col].fillna(df[col].mode()[0], inplace=True)
+                    elif method == 'ffill':
+                        df[col].fillna(method='ffill', inplace=True)
+                    elif method == 'bfill':
+                        df[col].fillna(method='bfill', inplace=True)
+                    
+                    logging.info(f"컬럼 '{col}'의 결측값 {missing_count}개를 '{method}' 방식으로 처리했습니다.")
         
         logging.info("결측값 처리 완료")
     
