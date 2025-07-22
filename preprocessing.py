@@ -2,7 +2,6 @@ import pandas as pd
 import numpy as np
 import config.config as cf
 from typing import Tuple, Dict, List, Optional
-from config.logger_config import setup_logger
 import logging
 
 class PowerUsagePreprocessor:
@@ -11,10 +10,11 @@ class PowerUsagePreprocessor:
         self.train = None
         self.test = None
         self.building = None
-        self.sample = None
+        self.sample_submission = None
         
         # 로깅 설정
-        setup_logger()
+        logging.basicConfig(level=logging.INFO)
+        self.logger = logging.getLogger(__name__)
         
         # 컬럼명 매핑 딕셔너리
         self.column_mappings = {
@@ -32,13 +32,13 @@ class PowerUsagePreprocessor:
         try:
             self.train = pd.read_csv(f'{self.data_dir}/train.csv')
             self.test = pd.read_csv(f'{self.data_dir}/test.csv')
-            self.sample = pd.read_csv(f'{self.data_dir}/sample_submission.csv')
+            self.sample_submission = pd.read_csv(f'{self.data_dir}/sample_submission.csv')
             self.building = pd.read_csv(f'{self.data_dir}/building_info.csv')
             
             logging.info(f"데이터 로딩 완료 - Train: {self.train.shape}, Test: {self.test.shape}, "
-                           f"Sample: {self.sample.shape}, Building: {self.building.shape}")
+                           f"Sample: {self.sample_submission.shape}, Building: {self.building.shape}")
             
-            return self.train, self.test, self.sample, self.building
+            return self.train, self.test, self.sample_submission, self.building
             
         except Exception as e:
             logging.error(f"데이터 로딩 중 오류 발생: {e}")
@@ -89,7 +89,47 @@ class PowerUsagePreprocessor:
                 ]).astype(int)
         
         logging.info("날짜/시간 특성 추출 완료")
-    
+
+    def drop_columns(self, columns: List[str]) -> None:
+        logging.info(f"제거할 컬럼: {columns}")
+        
+        for df in [self.train, self.test]:
+            if df is not None:
+                df.drop(columns=columns, inplace=True, errors='ignore')
+        
+        logging.info("지정된 컬럼 제거 완료")
+
+    def add_columns(self, target_attr: str, columns: Dict[str, List[str]]) -> None:
+        """
+        특정 데이터프레임 속성(self.train, self.test 등)에 새로운 컬럼 추가
+        Args:
+            target_attr: 대상 데이터프레임 속성명 ('train', 'test', 'building' 등)
+            columns: {column_name: [value for each row], ...}
+        """
+        logging.info(f"{target_attr}에 추가할 컬럼: {list(columns.keys())}") 
+        
+        # 대상 데이터프레임 속성 가져오기
+        if not hasattr(self, target_attr):
+            logging.error(f"'{target_attr}' 속성이 존재하지 않습니다.")
+            return
+            
+        df = getattr(self, target_attr)
+        if df is None:
+            logging.error(f"'{target_attr}' 데이터프레임이 None입니다.")
+            return
+            
+        # 컬럼 추가
+        for col_name, values in columns.items():
+            if col_name not in df.columns:
+                df[col_name] = values
+                logging.info(f"'{col_name}' 칼럼이 추가되었습니다.")
+                print(df.head())  # 추가된 칼럼의 일부 데이터 출력
+            else:
+                logging.warning(f"'{col_name}' 칼럼이 이미 존재합니다. 덮어쓰지 않습니다.")
+        
+        # 업데이트된 데이터프레임을 다시 클래스 속성에 할당
+        setattr(self, target_attr, df)
+
     def preprocess_building_info(self) -> None:
         """
         건물 정보 전처리
@@ -156,47 +196,186 @@ class PowerUsagePreprocessor:
         
         logging.info("결측값 처리 완료")
     
-    def detect_outliers(self, columns: List[str] = None, method: str = 'iqr', 
-                       threshold: float = 1.5) -> Dict[str, pd.Series]:
+    def detect_outliers(self, columns: List[str] = None, method: str = 'rolling', 
+                       threshold: float = 3.0, window: int = 24) -> Dict[str, pd.Series]:
         """
-        이상치 탐지
+        시계열 데이터에 적합한 이상치 탐지, 특히 power_usage를 위한 방법
         
         Args:
             columns: 이상치를 탐지할 컬럼 리스트
-            method: 이상치 탐지 방법 ('iqr', 'zscore')
+            method: 이상치 탐지 방법 ('iqr', 'zscore', 'rolling', 'seasonal', 'stl', 'isolation_forest')
             threshold: 이상치 임계값
-            
+            window: rolling 방법 사용 시 윈도우 크기
         Returns:
             Dict containing outlier indices for each column
         """
-        logging.info(f"이상치 탐지 중 (방법: {method})...")
+        logging.info(f"시계열 데이터의 이상치 탐지 중 (방법: {method})...")
         
         if self.train is None:
             return {}
         
         if columns is None:
-            columns = ['power_usage', 'temperature', 'rain', 'wind', 'humidity', 'sun', 'solar']
-            columns = [col for col in columns if col in self.train.columns]
+            # power_usage가 주요 타겟
+            columns = ['power_usage']
+            if 'temperature' in self.train.columns:  # 전력 사용량과 관련된 주요 변수들
+                columns.extend(['temperature'])
         
         outliers = {}
         
         for col in columns:
+            if col not in self.train.columns:
+                continue
+                
             if method == 'iqr':
-                Q1 = self.train[col].quantile(0.25)
-                Q3 = self.train[col].quantile(0.75)
-                IQR = Q3 - Q1
-                lower_bound = Q1 - threshold * IQR
-                upper_bound = Q3 + threshold * IQR
-                outliers[col] = self.train[(self.train[col] < lower_bound) | 
-                                         (self.train[col] > upper_bound)].index
-            
+                # 각 건물별, 시간대별로 IQR 기반 이상치 탐지 (시계열 특성 고려)
+                outliers[col] = pd.Series(dtype=int)
+                for bldg in self.train['building_num'].unique():
+                    for hour in range(24):
+                        subset = self.train[(self.train['building_num'] == bldg) & 
+                                          (self.train['hour'] == hour)][col]
+                        if len(subset) < 10:  # 충분한 데이터가 없으면 건너뜀
+                            continue
+                        Q1 = subset.quantile(0.25)
+                        Q3 = subset.quantile(0.75)
+                        IQR = Q3 - Q1
+                        lower_bound = Q1 - threshold * IQR
+                        upper_bound = Q3 + threshold * IQR
+                        outlier_idx = subset[(subset < lower_bound) | (subset > upper_bound)].index
+                        outliers[col] = pd.concat([outliers[col], pd.Series(outlier_idx)])
+
             elif method == 'zscore':
-                from scipy import stats
-                z_scores = np.abs(stats.zscore(self.train[col].dropna()))
-                outliers[col] = self.train.loc[self.train[col].dropna().index[z_scores > threshold]].index
-        
+                # 건물별, 요일/시간대별 Z-score 계산
+                outliers[col] = pd.Series(dtype=int)
+                for bldg in self.train['building_num'].unique():
+                    for day_type in ['weekday', 'weekend']:
+                        for hour in range(24):
+                            subset = self.train[(self.train['building_num'] == bldg) &
+                                              (self.train['day_type'] == day_type) &
+                                              (self.train['hour'] == hour)][col]
+                            if len(subset) < 10:
+                                continue
+                            from scipy import stats
+                            z_scores = np.abs(stats.zscore(subset.dropna()))
+                            outlier_idx = subset.dropna().index[z_scores > threshold]
+                            outliers[col] = pd.concat([outliers[col], pd.Series(outlier_idx)])
+
+            elif method == 'rolling':
+                # 건물별 시계열 롤링 윈도우 기반 이상치 탐지
+                outliers[col] = pd.Series(dtype=int)
+                for bldg in self.train['building_num'].unique():
+                    bldg_data = self.train[self.train['building_num'] == bldg].sort_values('date_time')
+                    rolling_mean = bldg_data[col].rolling(window, min_periods=5, center=True).mean()
+                    rolling_std = bldg_data[col].rolling(window, min_periods=5, center=True).std()
+                    diff = np.abs(bldg_data[col] - rolling_mean)
+                    outlier_mask = diff > (threshold * rolling_std)
+                    # NaN 처리
+                    outlier_mask = outlier_mask.fillna(False)
+                    outlier_idx = bldg_data.loc[outlier_mask].index
+                    outliers[col] = pd.concat([outliers[col], pd.Series(outlier_idx)])
+
+            elif method == 'seasonal':
+                # 시계열 데이터의 계절성 고려 (시간대별, 요일별 패턴)
+                from statsmodels.tsa.seasonal import seasonal_decompose
+                
+                outliers[col] = pd.Series(dtype=int)
+                for bldg in self.train['building_num'].unique():
+                    bldg_data = self.train[self.train['building_num'] == bldg].sort_values('date_time')
+                    
+                    # 충분한 데이터가 있는지 확인
+                    if len(bldg_data) < 48:  # 최소 2일치 데이터
+                        continue
+                    
+                    try:
+                        # 하루 단위(24시간) 주기로 분해
+                        decomposition = seasonal_decompose(bldg_data[col], period=24, model='additive')
+                        residual = decomposition.resid
+                        
+                        # 잔차의 표준편차를 기준으로 이상치 탐지
+                        std_resid = np.std(residual.dropna())
+                        outlier_idx = bldg_data[np.abs(residual) > threshold * std_resid].index
+                        outliers[col] = pd.concat([outliers[col], pd.Series(outlier_idx)])
+                    except:
+                        logging.warning(f"건물 {bldg}의 계절성 분해 실패, 건너뜀")
+                        continue
+                        
+            elif method == 'stl':
+                # STL 분해 방법 (계절성-트렌드-잔차)
+                try:
+                    from statsmodels.tsa.seasonal import STL
+                    
+                    outliers[col] = pd.Series(dtype=int)
+                    for bldg in self.train['building_num'].unique():
+                        bldg_data = self.train[self.train['building_num'] == bldg].sort_values('date_time')
+                        
+                        # 충분한 데이터가 있는지 확인 (STL은 더 많은 데이터가 필요)
+                        if len(bldg_data) < 72:  # 최소 3일치 데이터
+                            continue
+                            
+                        # 연속적인 시계열 데이터인지 확인
+                        if bldg_data['date_time'].diff().dt.total_seconds().max() > 3600:
+                            # 시간 단위 데이터가 연속적이지 않으면 재샘플링
+                            bldg_data = bldg_data.set_index('date_time').resample('H').mean().reset_index()
+                            
+                        try:
+                            # STL 분해 수행 (일간, 주간 계절성 모두 고려)
+                            # period=24: 일간 주기, period=168: 주간 주기 (24*7)
+                            stl = STL(bldg_data[col], 
+                                     period=24,
+                                     seasonal=13,  # 계절성 윈도우 (2*period+1 권장)
+                                     trend=25,     # 트렌드 윈도우
+                                     robust=True)  # 이상치에 강건한 분해
+                            result = stl.fit()
+                            
+                            # 잔차 기반 이상치 탐지
+                            residual = result.resid
+                            resid_std = np.std(residual.dropna())
+                            
+                            # 임계값 적용
+                            outlier_mask = np.abs(residual) > threshold * resid_std
+                            outlier_idx = bldg_data.index[outlier_mask]
+                            outliers[col] = pd.concat([outliers[col], pd.Series(outlier_idx)])
+                            
+                            logging.info(f"건물 {bldg} STL 분해 완료: {sum(outlier_mask)} 이상치 발견")
+                        except Exception as e:
+                            logging.warning(f"건물 {bldg}의 STL 분해 실패: {e}")
+                            continue
+                except ImportError:
+                    logging.warning("statsmodels STL 모듈을 불러올 수 없습니다")
+                    continue
+
+            elif method == 'isolation_forest':
+                # 고급 머신러닝 기반 이상치 탐지
+                try:
+                    from sklearn.ensemble import IsolationForest
+                    
+                    outliers[col] = pd.Series(dtype=int)
+                    for bldg in self.train['building_num'].unique():
+                        bldg_data = self.train[self.train['building_num'] == bldg]
+                        
+                        # 특성 선택 (시간 특성 + 관련 수치 특성)
+                        features = ['hour', 'day_of_week']
+                        for feat in ['temperature', 'humidity', col]:
+                            if feat in bldg_data.columns:
+                                features.append(feat)
+                        
+                        if len(bldg_data) < 50:  # 데이터가 충분하지 않으면 건너뜀
+                            continue
+                        
+                        X = bldg_data[features].fillna(method='ffill')
+                        model = IsolationForest(contamination=0.05, random_state=42)
+                        preds = model.fit_predict(X)
+                        outlier_idx = bldg_data.index[preds == -1]
+                        outliers[col] = pd.concat([outliers[col], pd.Series(outlier_idx)])
+                except ImportError:
+                    logging.warning("sklearn 모듈이 없어 isolation_forest 방법을 사용할 수 없습니다")
+                    continue
+
+        # 중복 제거
+        for col in outliers:
+            outliers[col] = pd.Series(outliers[col].unique())
+            
         total_outliers = sum(len(indices) for indices in outliers.values())
-        logging.info(f"이상치 탐지 완료 - 총 {total_outliers}개 이상치 발견")
+        logging.info(f"시계열 이상치 탐지 완료 - 총 {total_outliers}개 이상치 발견")
         
         return outliers
     
@@ -359,10 +538,9 @@ class PowerUsagePreprocessor:
         if save_data:
             self.save_processed_data()
         
-        logging.info("전체 전처리 파이프라인 완료!")
+        self.logger.info("전체 전처리 파이프라인 완료!")
         
         return self.train, self.test
-
 
 # 사용 예시
 if __name__ == "__main__":
