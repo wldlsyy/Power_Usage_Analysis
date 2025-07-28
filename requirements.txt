@@ -4,3 +4,7 @@ scikit-learn
 matplotlib
 seaborn
 keras
+statsmodels
+plotly
+ipywidgets
+nbformat

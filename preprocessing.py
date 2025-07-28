@@ -15,16 +15,6 @@ class PowerUsagePreprocessor:
         # 로깅 설정
         logging.basicConfig(level=logging.INFO)
         self.logger = logging.getLogger(__name__)
-        
-        # 컬럼명 매핑 딕셔너리
-        self.column_mappings = {
-            'train': ['num_date_time', 'building_num', 'date_time', 'temperature', 
-                     'rain', 'wind', 'humidity', 'sunshine_duration', 'solar_radiation', 'power_usage'],
-            'test': ['num_date_time', 'building_num', 'date_time', 'temperature', 
-                    'rain', 'wind', 'humidity'],
-            'building': ['building_num', 'building_type', 'floor_area', 'cool_area', 
-                        'solar_capacity', 'ess_capacity', 'pcs_capacity']
-        }
     
     def load_data(self) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         logging.info("데이터 로딩 시작...")
@@ -44,20 +34,55 @@ class PowerUsagePreprocessor:
             logging.error(f"데이터 로딩 중 오류 발생: {e}")
             raise
     
-    def _rename_columns(self) -> None:
+    def rename_columns(self, column_mappings: Dict[str, List[str]]) -> None:
         """
         데이터프레임 컬럼명을 영어로 변환
+        
+        Args:
+            column_mappings: 각 데이터프레임별 새로운 컬럼명 리스트
+                          예: {'train': ['col1', 'col2', ...], 'test': [...], 'building': [...]}
         """
         logging.info("컬럼명 영어 변환 중...")
         
-        if self.train is not None:
-            self.train.columns = self.column_mappings['train']
-        if self.test is not None:
-            self.test.columns = self.column_mappings['test']
-        if self.building is not None:
-            self.building.columns = self.column_mappings['building']
+        if 'train' in column_mappings and self.train is not None:
+            self.train.columns = column_mappings['train']
+        if 'test' in column_mappings and self.test is not None:
+            self.test.columns = column_mappings['test']
+        if 'building' in column_mappings and self.building is not None:
+            self.building.columns = column_mappings['building']
             
         logging.info("컬럼명 변환 완료")
+    
+    def map_values(self, target_df: str, column: str, value_mapping: Dict[str, str]) -> None:
+        """
+        특정 데이터프레임의 특정 컬럼 값을 매핑
+        
+        Args:
+            target_df: 대상 데이터프레임 ('train', 'test', 'building')
+            column: 매핑할 컬럼명
+            value_mapping: 값 매핑 딕셔너리 {기존값: 새로운값, ...}
+        """
+        logging.info(f"{target_df}의 {column} 컬럼 값 매핑 중...")
+        
+        # 대상 데이터프레임 가져오기
+        df = getattr(self, target_df, None)
+        if df is None:
+            logging.error(f"'{target_df}' 데이터프레임이 존재하지 않습니다.")
+            return
+            
+        if column not in df.columns:
+            logging.error(f"'{column}' 컬럼이 '{target_df}' 데이터프레임에 존재하지 않습니다.")
+            return
+            
+        # 값 매핑 적용
+        df[column] = df[column].map(value_mapping)
+        
+        # 매핑되지 않은 값 확인
+        unmapped_values = df[df[column].isnull()][column].unique()
+        if len(unmapped_values) > 0:
+            logging.warning(f"매핑되지 않은 값들: {unmapped_values}")
+        
+        logging.info(f"{column} 컬럼 값 매핑 완료")
     
     def preprocess_datetime(self) -> None:
         """
@@ -67,12 +92,12 @@ class PowerUsagePreprocessor:
         - 주말/평일 구분
         """
         logging.info("날짜/시간 특성 추출 중...")
-        
-        for df in [self.train, self.test]:
+        for df_name in ['train', 'test']:
+            df = getattr(self, df_name, None)
             if df is not None:
                 # datetime 변환 (YYYYMMDD HH 형태 -> datetime)
                 df['date_time'] = pd.to_datetime(df['date_time'], format='%Y%m%d %H')
-                
+            
                 # 시간 특성 추출
                 df['month'] = df['date_time'].dt.month
                 df['day'] = df['date_time'].dt.day
@@ -80,9 +105,7 @@ class PowerUsagePreprocessor:
                 df['day_of_week'] = df['date_time'].dt.dayofweek
                 
                 # 주말/평일 구분
-                df['day_type'] = df['day_of_week'].apply(lambda x: 'weekend' if x >= 5 else 'weekday')
-                # day_of_week는 필요없으니 제거
-                self.drop_columns(['day_of_week'])
+                df['weekend'] = df['day_of_week'].apply(lambda x: 1 if x >= 5 else 0)
 
                 # 공휴일 표시 (2024-06-06, 2024-08-15)
                 holiday_dates = ['2024-06-06', '2024-08-15']
@@ -92,10 +115,56 @@ class PowerUsagePreprocessor:
         
         logging.info("날짜/시간 특성 추출 완료")
 
-    def drop_columns(self, columns: List[str]) -> None:
-        logging.info(f"제거할 컬럼: {columns}")
+    def sin_cosine_date_features(self) -> None:
+        """
+        시간 변수의 순환적 성격을 반영하기 위해 sine, cosine 함수 적용
+        - 시간대(0~23시), 날짜, 월, 요일을 sine/cosine 값으로 변환
+        """
+        logging.info("시간 변수의 순환적 성격 반영 중...")
         
-        for df in [self.train, self.test]:
+        for df_name in ['train', 'test']:
+            df = getattr(self, df_name, None)
+            if df is not None and 'hour' in df.columns:
+                # 시간
+                df['sin_hour'] = np.sin(2 * np.pi * df['hour']/23.0)
+                df['cos_hour'] = np.cos(2 * np.pi * df['hour']/23.0)
+                
+                # 날짜
+                df['sin_date'] = -np.sin(2 * np.pi * (df['month']+df['day']/31)/12)
+                df['cos_date'] = -np.cos(2 * np.pi * (df['month']+df['day']/31)/12)
+                
+                # 월
+                df['sin_month'] = -np.sin(2 * np.pi * df['month']/12.0)
+                df['cos_month'] = -np.cos(2 * np.pi * df['month']/12.0)
+
+                # 요일
+                df['sin_dayofweek'] = -np.sin(2 * np.pi * (df['day_of_week']+1)/7.0)
+                df['cos_dayofweek'] = -np.cos(2 * np.pi * (df['day_of_week']+1)/7.0)
+        
+        logging.info("시간 변수의 순환적 성격 반영 완료")
+
+    def drop_columns(self, target_df: str, columns: List[str]) -> None:
+        """
+        지정된 컬럼을 특정 데이터프레임에서 제거
+
+        Args:
+            target_df: 대상 데이터프레임 이름 ('train', 'test', 'building' 등). None이면 train/test 모두 적용
+            columns: 제거할 컬럼 리스트
+        """
+        logging.info(f"제거할 컬럼: {columns} (대상: {target_df if target_df else 'train, test'})")
+        
+        dfs = []
+        if target_df is None:
+            dfs = [self.train, self.test]
+        else:
+            df = getattr(self, target_df, None)
+            if df is not None:
+                dfs = [df]
+            else:
+                logging.warning(f"'{target_df}' 데이터프레임이 존재하지 않습니다.")
+                return
+
+        for df in dfs:
             if df is not None:
                 df.drop(columns=columns, inplace=True, errors='ignore')
         
@@ -508,72 +577,3 @@ class PowerUsagePreprocessor:
             self.building.to_csv(f'{output_dir}/building_processed.csv', index=False)
         
         logging.info("데이터 저장 완료")
-    
-    def run_full_preprocessing(self, save_data: bool = True, 
-                             remove_outliers: bool = False,
-                             missing_value_strategy: Dict[str, str] = None) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        """
-        전체 전처리 파이프라인 실행
-        
-        Args:
-            save_data: 전처리된 데이터 저장 여부
-            remove_outliers: 이상치 제거 여부
-            missing_value_strategy: 결측값 처리 전략
-            
-        Returns:
-            Tuple containing processed train and test DataFrames
-        """
-        logging.info("전체 전처리 파이프라인 시작...")
-        
-        # 1. 데이터 로드
-        self.load_data()
-        
-        # 2. 컬럼명 변환
-        self._rename_columns()
-        
-        # 3. 날짜/시간 전처리
-        self.preprocess_datetime()
-        
-        # 4. 건물 정보 전처리
-        self.preprocess_building_info()
-        
-        # 5. 데이터 병합
-        self.merge_data()
-        
-        # 6. 결측값 처리
-        self.handle_missing_values(missing_value_strategy)
-        
-        # 7. 이상치 처리 (선택사항)
-        if remove_outliers:
-            self.remove_outliers()
-        
-        # 8. 추가 특성 생성
-        # self.create_features()
-        
-        # 9. 데이터 저장 (선택사항)
-        if save_data:
-            self.save_processed_data()
-        
-        self.logger.info("전체 전처리 파이프라인 완료!")
-        
-        return self.train, self.test
-
-# 사용 예시
-if __name__ == "__main__":
-    # 전처리기 인스턴스 생성
-    preprocessor = PowerUsagePreprocessor()
-    
-    # 전체 전처리 실행
-    train_processed, test_processed = preprocessor.run_full_preprocessing(
-        save_data=True,
-        remove_outliers=False  # 이상치 제거는 선택사항
-    )
-    
-    # 데이터 정보 출력
-    data_info = preprocessor.get_data_info()
-    print("전처리 완료된 데이터 정보:")
-    for dataset_name, info in data_info.items():
-        print(f"\n{dataset_name.upper()}:")
-        print(f"  Shape: {info['shape']}")
-        print(f"  Memory Usage: {info['memory_usage']}")
-        print(f"  Missing Values: {sum(info['missing_values'].values())} total")
