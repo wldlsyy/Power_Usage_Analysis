@@ -103,6 +103,7 @@ class PowerUsagePreprocessor:
                 df['day'] = df['date_time'].dt.day
                 df['hour'] = df['date_time'].dt.hour
                 df['day_of_week'] = df['date_time'].dt.dayofweek
+                df['date'] = df['date_time'].dt.date
                 
                 # 주말/평일 구분
                 df['weekend'] = df['day_of_week'].apply(lambda x: 1 if x >= 5 else 0)
